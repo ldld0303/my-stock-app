@@ -54,7 +54,7 @@ main_stock = (
     .strip()
     .zfill(6)
 )
-start_date = st.sidebar.date_input("📅 开始日期", datetime.date(2024, 1, 1))
+start_date = st.sidebar.date_input("📅 开始日期", datetime.date(2000, 1, 1))
 end_date = st.sidebar.date_input("📅 结束日期", datetime.date.today())
 
 st.title("📈 A股全景量化决策与AI智能诊股终端")

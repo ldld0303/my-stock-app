@@ -1,0 +1,35 @@
+name: Keep Streamlit App Alive
+
+on:
+  schedule:
+    # 每 2 天自动在后台运行一次
+    - cron: '0 8 */2 * *'
+  workflow_dispatch: # 支持在 GitHub 页面手动点击触发
+
+jobs:
+  keep-alive:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Puppeteer
+        run: npm install puppeteer
+
+      - name: Open App in Headless Chrome
+        run: |
+          node -e "
+          const puppeteer = require('puppeteer');
+          (async () => {
+            const browser = await puppeteer.launch({ headless: 'new' });
+            const page = await browser.newPage();
+            console.log('Connecting to Streamlit...');
+            // https://my-stock-app-nqyn5agryfl6ggzjezvvms.streamlit.app/
+            await page.goto('https://<替换为你的应用真实网址>.streamlit.app', { waitUntil: 'networkidle2', timeout: 60000 });
+            console.log('Successfully connected and rendered WebSocket!');
+            await new Promise(r => setTimeout(r, 15000));
+            await browser.close();
+          })();
+          "

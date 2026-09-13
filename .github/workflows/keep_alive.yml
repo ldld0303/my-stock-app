@@ -2,9 +2,9 @@ name: Keep Streamlit App Alive
 
 on:
   schedule:
-    # 每 2 天自动后台运行一次
-    - cron: '0 8 */2 * *'
-  workflow_dispatch: # 支持手动点击触发
+    # 每天 UTC 时间 2:00 和 14:00 (北京时间 10:00 和 22:00) 各自动运行一次
+    - cron: '0 2,14 * * *'
+  workflow_dispatch:
 
 jobs:
   keep-alive:

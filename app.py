@@ -1,13 +1,11 @@
 import datetime
 import json
+import time
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 import requests
 import streamlit as st
 
-# 尝试导入可选库，避免缺失导致程序崩溃
 try:
     import baostock as bs
 except Exception:
@@ -29,7 +27,6 @@ st.set_page_config(
 
 st.sidebar.header("⚙️ 系统配置与参数")
 
-# 硅基流动 API Key 配置区
 sf_api_key = st.sidebar.text_input(
     "🔑 硅基流动 API Key",
     value="",
@@ -48,24 +45,52 @@ sf_model = st.sidebar.selectbox(
 
 st.sidebar.markdown("---")
 
-# 全局核心标的与时间范围定义
 main_stock = (
     st.sidebar.text_input("📌 主分析股票代码 (如 300277):", value="300277")
     .strip()
     .zfill(6)
 )
-start_date = st.sidebar.date_input("📅 开始日期", datetime.date(2000, 1, 1))
+start_date = st.sidebar.date_input("📅 开始日期", datetime.date(2024, 1, 1))
 end_date = st.sidebar.date_input("📅 结束日期", datetime.date.today())
 
 st.title("📈 A股全景量化决策与AI智能诊股终端")
 
 
 # ==========================================
-# 2. 独立底层数据源获取函数 (实时行情 + 估值解析 + K线)
+# 2. 底层 API 与数据获取函数
 # ==========================================
 
+def call_siliconflow_api(prompt, api_key, model="deepseek-ai/DeepSeek-V3"):
+    """
+    调用硅基流动 (SiliconFlow) API 生成诊股报告
+    """
+    url = "https://api.siliconflow.cn/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "你是一位专业的A股量化分析师与资深证券投资顾问。"},
+            {"role": "user", "content": prompt}
+        ],
+        "stream": False,
+        "max_tokens": 2048,
+        "temperature": 0.7
+    }
+    try:
+        res = requests.post(url, json=payload, headers=headers, timeout=60)
+        if res.status_code == 200:
+            result = res.json()
+            return result["choices"][0]["message"]["content"]
+        else:
+            return f"❌ API 请求失败，状态码：{res.status_code}，错误信息：{res.text}"
+    except Exception as e:
+        return f"❌ 调用 硅基流动 API 出现异常：{str(e)}"
+
+
 def format_symbol_tencent(symbol):
-    """自动将纯数字代码转换为腾讯 API 要求的格式 (如 300277 -> sz300277)"""
     symbol = str(symbol).strip().lower()
     symbol = (
         symbol.replace(".sh", "")
@@ -75,10 +100,8 @@ def format_symbol_tencent(symbol):
         .replace("sz", "")
         .replace("bj", "")
     )
-
     if not symbol.isdigit() or len(symbol) != 6:
         return None
-
     if symbol.startswith(("6", "688", "900")):
         return f"sh{symbol}"
     elif symbol.startswith(("0", "3", "200")):
@@ -89,7 +112,6 @@ def format_symbol_tencent(symbol):
 
 
 def get_realtime_quote_tencent(symbol):
-    """腾讯 API 获取实时行情与实时估值数据（包含 PE、PB、总市值）"""
     clean_code = format_symbol_tencent(symbol)
     if not clean_code:
         return None
@@ -110,30 +132,11 @@ def get_realtime_quote_tencent(symbol):
                     return None
                 parts = data_str.split("~")
                 if len(parts) >= 38:
-                    pe = None
-                    total_mv = None
-                    pb = None
-
-                    # 解析 PE (索引 39)
-                    if len(parts) > 39 and parts[39] and parts[39] != "N/A":
-                        try:
-                            pe = float(parts[39])
-                        except Exception:
-                            pe = None
-
-                    # 解析 总市值/亿元 (索引 45)
-                    if len(parts) > 45 and parts[45] and parts[45] != "N/A":
-                        try:
-                            total_mv = float(parts[45])
-                        except Exception:
-                            total_mv = None
-
-                    # 解析 PB (索引 47)
-                    if len(parts) > 47 and parts[47] and parts[47] != "N/A":
-                        try:
-                            pb = float(parts[47])
-                        except Exception:
-                            pb = None
+                    pe = float(parts[39]) if len(parts) > 39 and parts[39] and parts[39] != "N/A" else None
+                    circ_mv = float(parts[44]) if len(parts) > 44 and parts[44] and parts[44] != "N/A" else None
+                    total_mv = float(parts[45]) if len(parts) > 45 and parts[45] and parts[45] != "N/A" else None
+                    pb = float(parts[47]) if len(parts) > 47 and parts[47] and parts[47] != "N/A" else None
+                    volume_ratio = float(parts[49]) if len(parts) > 49 and parts[49] and parts[49] != "N/A" else None
 
                     return {
                         "股票名称": parts[1],
@@ -147,268 +150,103 @@ def get_realtime_quote_tencent(symbol):
                         "最低价": float(parts[34]) if parts[34] else 0.0,
                         "成交额(万元)": round(float(parts[37]), 2) if parts[37] else 0.0,
                         "市盈率": pe,
+                        "流通市值(亿)": circ_mv,
                         "总市值(亿)": total_mv,
                         "市净率": pb,
+                        "量比": volume_ratio
                     }
     except Exception:
         pass
     return None
 
 
-# --- K线子源 1: 腾讯金融 K线接口 ---
-def get_kline_tencent(symbol, start_str, end_str):
-    clean_code = format_symbol_tencent(symbol)
-    if not clean_code:
-        return None
-
-    s_date = f"{start_str[:4]}-{start_str[4:6]}-{start_str[6:]}"
-    e_date = f"{end_str[:4]}-{end_str[4:6]}-{end_str[6:]}"
-
-    url = f"http://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={clean_code},day,{s_date},{e_date},640,qfq"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Referer": "https://finance.qq.com/",
-    }
-
-    try:
-        res = requests.get(url, headers=headers, timeout=4)
-        if res.status_code == 200:
-            res_json = res.json()
-            if res_json.get("code") == 0 and "data" in res_json:
-                stock_data = res_json["data"].get(clean_code, {})
-                klines = stock_data.get("qfqday", stock_data.get("day", []))
-                parsed = []
-                for k in klines:
-                    if len(k) >= 6:
-                        parsed.append({
-                            "日期": k[0],
-                            "Open": float(k[1]),
-                            "Close": float(k[2]),
-                            "High": float(k[3]),
-                            "Low": float(k[4]),
-                            "Volume": float(k[5]),
-                            "Amount": float(k[8]) * 10000.0 if len(k) > 8 and k[8] else 0.0,
-                            "Turnover": 0.0,
-                        })
-                if parsed:
-                    return pd.DataFrame(parsed)
-    except Exception:
-        pass
-    return None
-
-
-# --- K线子源 2: 东方财富 API ---
-def get_kline_eastmoney(symbol, start_str, end_str):
-    try:
-        secid = f"1.{symbol}" if symbol.startswith(("6", "900", "688")) else f"0.{symbol}"
-        url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
-        params = {
-            "secid": secid,
-            "ut": "fa5fd1943c09868513d6d6445ed27862",
-            "fields1": "f1,f2,f3,f4,f5,f6",
-            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
-            "klt": "101",
-            "fqt": "1",
-            "beg": start_str,
-            "end": end_str,
-        }
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Referer": "https://quote.eastmoney.com/",
-        }
-        res = requests.get(url, params=params, headers=headers, timeout=4)
-        data = res.json()
-        if data and "data" in data and data["data"] and "klines" in data["data"]:
-            klines = data["data"]["klines"]
-            parsed = []
-            for line in klines:
-                f = line.split(",")
-                parsed.append({
-                    "日期": f[0],
-                    "Open": float(f[1]),
-                    "Close": float(f[2]),
-                    "High": float(f[3]),
-                    "Low": float(f[4]),
-                    "Volume": float(f[5]),
-                    "Amount": float(f[6]),
-                    "Turnover": float(f[10]) if len(f) > 10 else 0.0,
-                })
-            return pd.DataFrame(parsed)
-    except Exception:
-        pass
-    return None
-
-
-# --- K线子源 3: 新浪 API ---
-def get_kline_sina(symbol, start_str, end_str):
-    try:
-        sina_prefix = (
-            "sh"
-            if symbol.startswith(("60", "688"))
-            else ("sz" if symbol.startswith(("00", "30")) else "bj")
-        )
-        sina_url = f"https://money.finance.sina.com.cn/quotes_service/api/json_p.php/CN_MarketData.getKLineData?symbol={sina_prefix}{symbol}&scale=240&ma=no&datalen=1024"
-        res = requests.get(
-            sina_url,
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-            },
-            timeout=4,
-        )
-        text = res.text.strip()
-        if text and text != "null" and "[]" not in text:
-            if text.startswith("(") and text.endswith(")"):
-                text = text[1:-1]
-            sina_data = json.loads(text)
-            parsed = []
-            for item in sina_data:
-                parsed.append({
-                    "日期": item["day"].split(" ")[0],
-                    "Open": float(item["open"]),
-                    "Close": float(item["close"]),
-                    "High": float(item["high"]),
-                    "Low": float(item["low"]),
-                    "Volume": float(item["volume"]),
-                    "Amount": 0.0,
-                    "Turnover": 0.0,
-                })
-            df = pd.DataFrame(parsed)
-            df["日期"] = pd.to_datetime(df["日期"])
-            start_dt = pd.to_datetime(start_str)
-            end_dt = pd.to_datetime(end_str)
-            df = df[(df["日期"] >= start_dt) & (df["日期"] <= end_dt)].reset_index(drop=True)
-            df["日期"] = df["日期"].dt.strftime("%Y-%m-%d")
-            return df
-    except Exception:
-        pass
-    return None
-
-
-# --- K线子源 4: BaoStock 直连 ---
-def get_kline_baostock(symbol, start_str, end_str):
-    if bs is None:
-        return None
-    try:
-        prefix = "sh" if str(symbol).startswith(("6", "9")) else "sz"
-        code = f"{prefix}.{str(symbol).zfill(6)}"
-
-        s_date = f"{start_str[:4]}-{start_str[4:6]}-{start_str[6:]}"
-        e_date = f"{end_str[:4]}-{end_str[4:6]}-{end_str[6:]}"
-
-        lg = bs.login()
-        if lg.error_code != "0":
-            return None
-
-        rs = bs.query_history_k_data_plus(
-            code,
-            "date,open,high,low,close,volume,amount,turnover",
-            start_date=s_date,
-            end_date=e_date,
-            adjustflag="2",
-        )
-
-        data_list = []
-        while (rs.error_code == "0") & rs.next():
-            data_list.append(rs.get_row_data())
-        bs.logout()
-
-        if not data_list:
-            return None
-
-        df = pd.DataFrame(data_list, columns=rs.fields)
-        for col in ["open", "high", "low", "close", "volume", "amount", "turnover"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-        df.rename(
-            columns={
-                "date": "日期",
-                "open": "Open",
-                "high": "High",
-                "low": "Low",
-                "close": "Close",
-                "volume": "Volume",
-                "amount": "Amount",
-                "turnover": "Turnover",
-            },
-            inplace=True,
-        )
-        return df
-    except Exception:
-        pass
-    return None
-
-
-# --- 主调度引擎：5 重切换降级获取 K 线 ---
 @st.cache_data(ttl=1800)
 def fetch_stock_kline(symbol, start, end):
     symbol = str(symbol).strip().zfill(6)
     start_str = start.strftime("%Y%m%d")
     end_str = end.strftime("%Y%m%d")
 
+    clean_code = format_symbol_tencent(symbol)
     df = None
 
-    # 1. 优先调用腾讯金融 K 线 API
-    df = get_kline_tencent(symbol, start_str, end_str)
+    # 1. 优先调用腾讯接口（重试 2 次）
+    if clean_code:
+        s_date = f"{start_str[:4]}-{start_str[4:6]}-{start_str[6:]}"
+        e_date = f"{end_str[:4]}-{end_str[4:6]}-{end_str[6:]}"
+        url = f"http://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={clean_code},day,{s_date},{e_date},640,qfq"
 
-    # 2. 备用源：东方财富 API
-    if df is None or df.empty:
-        df = get_kline_eastmoney(symbol, start_str, end_str)
+        for attempt in range(2):
+            try:
+                res = requests.get(url, timeout=6)
+                if res.status_code == 200:
+                    res_json = res.json()
+                    if res_json.get("code") == 0 and "data" in res_json:
+                        stock_data = res_json["data"].get(clean_code, {})
+                        klines = stock_data.get("qfqday", stock_data.get("day", []))
+                        parsed = []
+                        for k in klines:
+                            if len(k) >= 6:
+                                parsed.append({
+                                    "日期": k[0],
+                                    "Open": float(k[1]),
+                                    "Close": float(k[2]),
+                                    "High": float(k[3]),
+                                    "Low": float(k[4]),
+                                    "Volume": float(k[5]),
+                                })
+                        if parsed:
+                            df = pd.DataFrame(parsed)
+                            break
+            except Exception:
+                time.sleep(0.2)
 
-    # 3. 备用源：新浪 API
-    if df is None or df.empty:
-        df = get_kline_sina(symbol, start_str, end_str)
-
-    # 4. 备用源：BaoStock 直连
-    if df is None or df.empty:
-        df = get_kline_baostock(symbol, start_str, end_str)
-
-    # 5. 备用源：AkShare 官方调用
+    # 2. 腾讯接口失败时，降级调取 AkShare 接口
     if (df is None or df.empty) and ak is not None:
-        try:
-            df_ak = ak.stock_zh_a_hist(
-                symbol=symbol,
-                period="daily",
-                start_date=start_str,
-                end_date=end_str,
-                adjust="qfq",
-            )
-            if df_ak is not None and not df_ak.empty:
-                df = df_ak.rename(
-                    columns={
-                        "日期": "日期",
-                        "开盘": "Open",
-                        "收盘": "Close",
-                        "最高": "High",
-                        "最低": "Low",
-                        "成交量": "Volume",
-                        "成交额": "Amount",
-                        "换手率": "Turnover",
-                    }
+        for attempt in range(2):
+            try:
+                df_ak = ak.stock_zh_a_hist(
+                    symbol=symbol,
+                    period="daily",
+                    start_date=start_str,
+                    end_date=end_str,
+                    adjust="qfq",
                 )
-        except Exception:
-            df = None
+                if df_ak is not None and not df_ak.empty:
+                    df = df_ak.rename(
+                        columns={
+                            "日期": "日期",
+                            "开盘": "Open",
+                            "收盘": "Close",
+                            "最高": "High",
+                            "最低": "Low",
+                            "成交量": "Volume",
+                        }
+                    )
+                    break
+            except Exception:
+                time.sleep(0.3)
 
     if df is None or df.empty:
         return None
 
-    # 标准化指标计算
     try:
         df["日期"] = pd.to_datetime(df["日期"])
         df = df.sort_values("日期").reset_index(drop=True)
 
         # 均线计算
         df["MA5"] = df["Close"].rolling(5).mean()
+        df["MA10"] = df["Close"].rolling(10).mean()
         df["MA20"] = df["Close"].rolling(20).mean()
         df["MA60"] = df["Close"].rolling(60).mean()
 
-        # RSI 计算 (14日)
+        # RSI (14日)
         delta = df["Close"].diff()
         gain = (delta.where(delta > 0, 0)).rolling(14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
         rs = gain / loss
         df["RSI"] = 100 - (100 / (1 + rs))
 
-        # ATR 真实波幅计算 (14日)
+        # ATR (14日)
         high_low = df["High"] - df["Low"]
         high_close = (df["High"] - df["Close"].shift()).abs()
         low_close = (df["Low"] - df["Close"].shift()).abs()
@@ -420,311 +258,268 @@ def fetch_stock_kline(symbol, start, end):
         return None
 
 
-@st.cache_data(ttl=1800)
-def fetch_financial_metrics(symbol, realtime_quote=None):
-    """获取主要基本面与估值指标 (带有实时行情兜底机制)"""
-    symbol = str(symbol).strip().zfill(6)
-    pe_ttm, pb, total_mv = None, None, None
-    df_abstract = None
+# ==========================================
+# 3. 严格对齐 5 大指标的全市场扫盘与诊股引擎
+# ==========================================
 
-    # 1. 优先提取腾讯实时 API 抓取到的最新估值
-    if realtime_quote:
-        pe_ttm = realtime_quote.get("市盈率")
-        pb = realtime_quote.get("市净率")
-        total_mv = realtime_quote.get("总市值(亿)")
-
-    # 2. 若实时数据缺少某项，尝试调用 AkShare 降级补充
-    if (pe_ttm is None or pb is None or total_mv is None) and ak is not None:
-        try:
-            df_ind = ak.stock_a_indicator_lg(symbol=symbol)
-            if df_ind is not None and not df_ind.empty:
-                latest = df_ind.iloc[-1]
-                if pe_ttm is None:
-                    pe_ttm = latest.get("pe_ttm", latest.get("pe", None))
-                if pb is None:
-                    pb = latest.get("pb", None)
-                if total_mv is None:
-                    raw_mv = latest.get("total_mv", None)
-                    if raw_mv is not None:
-                        total_mv = float(raw_mv) / 10000.0 if float(raw_mv) > 10000 else float(raw_mv)
-        except Exception:
-            pass
-
-    # 3. 抓取财务报表摘要
-    if ak is not None:
-        try:
-            df_abstract = ak.stock_financial_abstract(symbol=symbol)
-        except Exception:
-            df_abstract = None
-
-    return {"pe_ttm": pe_ttm, "pb": pb, "total_mv": total_mv}, df_abstract
-
-
-@st.cache_data(ttl=3600)
-def fetch_lhb_data(symbol):
-    """获取龙虎榜机构与游资席位数据"""
-    symbol = str(symbol).strip().zfill(6)
-    if ak is not None:
-        try:
-            today_str = datetime.date.today().strftime("%Y%m%d")
-            start_90d = (datetime.date.today() - datetime.timedelta(days=90)).strftime("%Y%m%d")
-            df_lhb = ak.stock_lhb_detail_em(start_date=start_90d, end_date=today_str)
-            if df_lhb is not None and not df_lhb.empty:
-                return df_lhb[df_lhb["代码"] == symbol]
-        except Exception:
-            pass
-    return pd.DataFrame()
-
-
-def call_siliconflow_api(prompt, api_key, model_name):
-    """调用硅基流动 API，带时效性强约束 System Prompt"""
-    api_key = api_key.strip() if api_key else "sk-rbkrovmorucwnivrifqgvvorzfwqsotxovgqbsoepwvmvzfg"
-
-    url = "https://api.siliconflow.cn/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-
-    # 动态系统日期
-    current_today_str = datetime.date.today().strftime("%Y年%m月%d日")
-
-    payload = {
-        "model": model_name,
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    f"你是一位拥有20年实战经验的资深量化交易员与证券分析师。"
-                    f"当前评估的基准系统日期为：【{current_today_str}】。\n"
-                    f"【核心原则】：你必须严格且仅根据用户在 Prompt 中提供的【最新实时行情、财务估值与技术指标】进行分析。"
-                    f"绝对禁止调用你内部训练集中2023年及之前的陈旧历史知识或生成旧年份的报告！"
-                ),
-            },
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0.4,
-        "max_tokens": 1500,
-    }
+@st.cache_data(ttl=300)
+def scan_market_5_rules_strict():
+    """
+    全市场 5 大选股条件严格过滤
+    """
+    if ak is None:
+        return pd.DataFrame()
     try:
-        res = requests.post(url, headers=headers, json=payload, timeout=30)
-        if res.status_code == 200:
-            return res.json()["choices"][0]["message"]["content"]
-        else:
-            return f"❌ API 调用失败 (HTTP {res.status_code}): {res.text}"
-    except Exception as e:
-        return f"❌ API 请求发生异常: {str(e)}"
+        df_spot = ak.stock_zh_a_spot_em()
+        if df_spot is None or df_spot.empty:
+            return pd.DataFrame()
+
+        # 数值清洗
+        df_spot["涨跌幅"] = pd.to_numeric(df_spot["涨跌幅"], errors="coerce")
+        df_spot["量比"] = pd.to_numeric(df_spot["量比"], errors="coerce")
+        df_spot["最新价"] = pd.to_numeric(df_spot["最新价"], errors="coerce")
+        df_spot["流通市值"] = pd.to_numeric(df_spot["流通市值"], errors="coerce")
+
+        df_spot["流通市值(亿)"] = df_spot["流通市值"] / 1e8
+
+        cond_pct = df_spot["涨跌幅"].between(3.0, 5.0)
+        cond_vr = (df_spot["量比"] > 1.0) | (df_spot["量比"].isna()) | (df_spot["量比"] == 0)
+        cond_mv = df_spot["流通市值(亿)"].between(50.0, 200.0)
+
+        candidates = df_spot[cond_pct & cond_vr & cond_mv].copy()
+        if candidates.empty:
+            return pd.DataFrame()
+
+        results = []
+        today_dt = datetime.date.today()
+        start_60d = today_dt - datetime.timedelta(days=120)
+
+        for idx, row in candidates.iterrows():
+            code = str(row["代码"]).zfill(6)
+            name = row["名称"]
+            price = row["最新价"]
+            pct = row["涨跌幅"]
+            vr = row["量比"]
+            circ_mv = row["流通市值(亿)"]
+
+            time.sleep(0.05)
+
+            df_k = fetch_stock_kline(code, start_60d, today_dt)
+            if df_k is not None and len(df_k) >= 20:
+                max_60d = df_k["High"].tail(60).max()
+                drop_ratio = (max_60d - price) / max_60d if max_60d > 0 else 0.0
+                c1_pass = drop_ratio >= 0.40
+
+                latest_k = df_k.iloc[-1]
+                ma5 = latest_k.get("MA5", 0)
+                ma10 = latest_k.get("MA10", 0)
+                ma20 = latest_k.get("MA20", 0)
+
+                c5_pass = (
+                        not pd.isna(ma5) and not pd.isna(ma10) and not pd.isna(ma20)
+                        and (ma5 > ma10 > ma20)
+                )
+
+                if c1_pass and c5_pass:
+                    results.append({
+                        "股票代码": code,
+                        "股票名称": name,
+                        "最新价": price,
+                        "涨跌幅(%)": pct,
+                        "量比": vr,
+                        "流通市值(亿)": round(circ_mv, 2),
+                        "60日高点跌幅(%)": round(drop_ratio * 100, 2),
+                        "MA5": round(ma5, 2),
+                        "MA10": round(ma10, 2),
+                        "MA20": round(ma20, 2),
+                        "均线形态": "MA5 > MA10 > MA20 (多头排列)"
+                    })
+
+        return pd.DataFrame(results)
+    except Exception:
+        return pd.DataFrame()
+
+
+def diagnose_stock_gap(symbol):
+    """
+    对比单只股票当前各项指标与 5 大选股标准的差距
+    """
+    code = str(symbol).strip().zfill(6)
+    quote = get_realtime_quote_tencent(code)
+    if not quote:
+        return None, f"❌ 无法获取股票 [{code}] 的实时数据，请检查代码是否输入正确。"
+
+    today_dt = datetime.date.today()
+    start_60d = today_dt - datetime.timedelta(days=120)
+    df_k = fetch_stock_kline(code, start_60d, today_dt)
+
+    if df_k is None or len(df_k) < 20:
+        return None, f"❌ 股票 [{code}] 的 K 线历史数据不足，无法计算均线与高点跌幅。"
+
+    price = quote["当前价格"]
+    pct = quote["涨跌幅(%)"]
+    vr = quote["量比"] if quote["量比"] is not None else 0.0
+    circ_mv = quote["流通市值(亿)"] if quote["流通市值(亿)"] is not None else 0.0
+
+    max_60d = df_k["High"].tail(60).max()
+    drop_ratio = (max_60d - price) / max_60d * 100 if max_60d > 0 else 0.0
+    c1_pass = drop_ratio >= 40.0
+    c1_gap = "✅ 满足" if c1_pass else f"❌ 差 {40.0 - drop_ratio:.2f}%（需再跌至 {max_60d * 0.6:.2f} 元）"
+
+    c2_pass = 3.0 <= pct <= 5.0
+    if c2_pass:
+        c2_gap = "✅ 满足"
+    elif pct < 3.0:
+        c2_gap = f"❌ 偏低 {3.0 - pct:.2f}%"
+    else:
+        c2_gap = f"❌ 超标 {pct - 5.0:.2f}%"
+
+    c3_pass = vr > 1.0
+    c3_gap = "✅ 满足" if c3_pass else f"❌ 偏低 {1.0 - vr:.2f}"
+
+    c4_pass = 50.0 <= circ_mv <= 200.0
+    if c4_pass:
+        c4_gap = "✅ 满足"
+    elif circ_mv < 50.0:
+        c4_gap = f"❌ 偏小 {50.0 - circ_mv:.2f} 亿"
+    else:
+        c4_gap = f"❌ 偏大 {circ_mv - 200.0:.2f} 亿"
+
+    latest_k = df_k.iloc[-1]
+    ma5 = latest_k.get("MA5", 0)
+    ma10 = latest_k.get("MA10", 0)
+    ma20 = latest_k.get("MA20", 0)
+    c5_pass = not (pd.isna(ma5) or pd.isna(ma10) or pd.isna(ma20)) and (ma5 > ma10 > ma20)
+    c5_gap = "✅ 满足 (MA5 > MA10 > MA20)" if c5_pass else "❌ 未形成多头排列"
+
+    matched_count = sum([c1_pass, c2_pass, c3_pass, c4_pass, c5_pass])
+
+    diag_data = [
+        {"指标名称": "1. 近 2-3 个月跌幅", "标准要求": "≥ 40.0%",
+         "实际数值": f"{drop_ratio:.2f}% (60日高点: {max_60d:.2f}元)", "差距判定": c1_gap},
+        {"指标名称": "2. 尾盘涨幅", "标准要求": "3.0% — 5.0%", "实际数值": f"{pct:+.2f}%", "差距判定": c2_gap},
+        {"指标名称": "3. 量比", "标准要求": "> 1.0", "实际数值": f"{vr:.2f}", "差距判定": c3_gap},
+        {"指标名称": "4. 流通市值", "标准要求": "50亿 — 200亿元", "实际数值": f"{circ_mv:.2f} 亿元",
+         "差距判定": c4_gap},
+        {"指标名称": "5. 均线形态", "标准要求": "MA5 > MA10 > MA20",
+         "实际数值": f"MA5:{ma5:.2f} | MA10:{ma10:.2f} | MA20:{ma20:.2f}", "差距判定": c5_gap},
+    ]
+
+    summary_info = {
+        "名称": quote["股票名称"],
+        "代码": code,
+        "匹配度": f"{matched_count} / 5 项条件达标"
+    }
+
+    return pd.DataFrame(diag_data), summary_info
 
 
 # ==========================================
-# 3. 全局数据加载与主界面渲染
+# 4. 界面渲染
 # ==========================================
 
-# 1. 优先获取毫秒级实时报价与估值
 realtime_quote = get_realtime_quote_tencent(main_stock)
 
-# 实时行情看板
 if realtime_quote:
     change_color = "🔴" if realtime_quote["涨跌幅(%)"] < 0 else "🟢"
     st.info(
         f"⚡ **实时行情看板** | {realtime_quote['股票名称']} ({realtime_quote['股票代码']}) | "
         f"当前最新价: **{realtime_quote['当前价格']:.2f} 元** | "
         f"涨跌幅: {change_color} **{realtime_quote['涨跌幅(%)']:+.2f}%** | "
-        f"今开: {realtime_quote['今日开盘']:.2f} | 昨收: {realtime_quote['昨日收盘']:.2f} | "
-        f"最高: {realtime_quote['最高价']:.2f} | 最低: {realtime_quote['最低价']:.2f} | "
         f"成交额: {realtime_quote['成交额(万元)']} 万元"
     )
-else:
-    st.warning(f"⚠️ 无法获取股票【{main_stock}】的实时行情（可能非交易时间或输入无效）。")
 
-# 2. 读取 K 线与基本面
-with st.spinner(f"正在读取股票 【{main_stock}】 的历史 K 线与基本面数据..."):
-    df_kline = fetch_stock_kline(main_stock, start_date, end_date)
-    val_dict, df_fin = fetch_financial_metrics(main_stock, realtime_quote)
+df_kline = fetch_stock_kline(main_stock, start_date, end_date)
 
-if df_kline is None or df_kline.empty:
-    st.error(
-        f"❌ 无法获取股票【{main_stock}】的历史 K 线数据。请确认侧边栏开始日期（目前为 {start_date}）不早于股票上市时间，或稍后再试。"
-    )
-else:
-    # 7 大功能选项卡
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-        "📈 全景技术指标",
-        "💰 主力资金与龙虎榜",
-        "📊 财务基本面与估值",
-        "🤖 AI诊股与打分卡",
-        "🧪 进阶策略回测",
-        "⚔️ 多股走势对比",
-        "📡 股票雷达选股",
-    ])
+tab1, tab2, tab3 = st.tabs(["📡 5大指标精准选股雷达", "📈 主分析标的行情", "🤖 股票量化打分卡与智能诊断报告"])
 
-    # ==========================================
-    # 模块 1：📈 全景 K 线与技术指标
-    # ==========================================
-    with tab1:
-        st.subheader(f"📈 股票 {main_stock} 全景技术指标看板")
+with tab1:
+    st.subheader("📡 5 大选股条件全市场扫盘系统")
 
-        latest_k = df_kline.iloc[-1]
-        atr_val = latest_k["ATR"] if not pd.isna(latest_k.get("ATR")) else 0.0
-        stop_loss_2atr = latest_k["Close"] - (2 * atr_val)
+    now_bj = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8)))
+    is_after_1430 = now_bj.time() >= datetime.time(14, 30)
 
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("最新收盘价", f"{latest_k['Close']:.2f} 元")
-        m2.metric(
-            "RSI (14日)",
-            f"{latest_k['RSI']:.2f}" if not pd.isna(latest_k.get("RSI")) else "N/A",
+    if not is_after_1430:
+        st.warning(
+            f"⏰ 当前北京时间为 **{now_bj.strftime('%H:%M:%S')}**（尚未到 14:30）。"
+            f"根据您的规则，尾盘（14:30 以后）进行选股扫描精度最高，当前测算仅供参考。"
         )
-        m3.metric("ATR (真实波幅)", f"{atr_val:.2f}")
-        m4.metric("建议止损参考位 (2xATR)", f"{stop_loss_2atr:.2f} 元")
+    else:
+        st.success(f"⏰ 当前北京时间为 **{now_bj.strftime('%H:%M:%S')}**，已满足 14:30 尾盘选股条件！")
 
-        fig = make_subplots(
-            rows=3,
-            cols=1,
-            shared_xaxes=True,
-            vertical_spacing=0.03,
-            row_heights=[0.5, 0.25, 0.25],
-        )
+    with st.expander("📋 当前运行的 5 大量化选股规则（已精准核对对齐）", expanded=True):
+        st.markdown("""
+        1. **近2-3个月内跌幅 ≥ 40%**（过去 60 交易日最高价对比当前最新价跌幅 40% 以上）
+        2. **当日涨幅 3.0% — 5.0%**（尾盘异动走强，锁定 3%—5% 区间）
+        3. **量比 > 1.0**（成交量放大，资金开始关注）
+        4. **流通市值在 50 亿 — 200 亿**（中等市值标的）
+        5. **5日、10日、20日均线呈多头排列**（短中期趋势多头共振：MA5 > MA10 > MA20）
+        """)
 
-        # K线 & 均线
-        fig.add_trace(
-            go.Candlestick(
-                x=df_kline["日期"],
-                open=df_kline["Open"],
-                high=df_kline["High"],
-                low=df_kline["Low"],
-                close=df_kline["Close"],
-                name="K线",
-            ),
-            row=1,
-            col=1,
-        )
+    if st.button("🚀 执行全市场 5 大指标精准扫盘选股", type="primary"):
+        with st.spinner("正在扫描全市场 A 股，匹配 5 大选股规则..."):
+            df_results = scan_market_5_rules_strict()
+            st.session_state["scan_results_df"] = df_results
+            if not df_results.empty:
+                st.success(f"🎯 扫描完成！全市场共筛选出 {len(df_results)} 只完全符合条件的股票！")
+            else:
+                st.warning("⚠️ 扫描完成，当前市场暂无完全符合该 5 大严格条件的股票。")
 
-        fig.add_trace(
-            go.Scatter(
-                x=df_kline["日期"],
-                y=df_kline["MA5"],
-                name="MA5",
-                line=dict(color="orange", width=1),
-            ),
-            row=1,
-            col=1,
-        )
-        fig.add_trace(
-            go.Scatter(
-                x=df_kline["日期"],
-                y=df_kline["MA20"],
-                name="MA20",
-                line=dict(color="blue", width=1.5),
-            ),
-            row=1,
-            col=1,
-        )
-        fig.add_trace(
-            go.Scatter(
-                x=df_kline["日期"],
-                y=df_kline["MA60"],
-                name="MA60",
-                line=dict(color="purple", width=1.5),
-            ),
-            row=1,
-            col=1,
-        )
+    scan_df = st.session_state.get("scan_results_df", pd.DataFrame())
 
-        # RSI
-        fig.add_trace(
-            go.Scatter(
-                x=df_kline["日期"],
-                y=df_kline["RSI"],
-                name="RSI(14)",
-                line=dict(color="magenta"),
-            ),
-            row=2,
-            col=1,
-        )
-        fig.add_hline(y=70, line_dash="dash", line_color="red", row=2, col=1)
-        fig.add_hline(y=30, line_dash="dash", line_color="green", row=2, col=1)
+    if not scan_df.empty:
+        matched_codes = scan_df["股票代码"].tolist()
+        code_str = ", ".join(matched_codes)
 
-        # 成交量
-        fig.add_trace(
-            go.Bar(
-                x=df_kline["日期"],
-                y=df_kline["Volume"],
-                name="成交量",
-                marker_color="teal",
-            ),
-            row=3,
-            col=1,
-        )
+        st.markdown("##### 📌 自动筛选结果股票代码池：")
+        st.text_area("符合条件的股票代码:", value=code_str, height=70)
 
-        fig.update_layout(
-            height=720,
-            xaxis_rangeslider_visible=False,
-            margin=dict(l=10, r=10, t=10, b=10),
-        )
-        st.plotly_chart(fig, use_container_width=True)
+        st.markdown("##### 📊 筛选股票盘面明细数据：")
+        st.dataframe(scan_df, use_container_width=True)
 
-    # ==========================================
-    # 模块 2：💰 主力资金与龙虎榜
-    # ==========================================
-    with tab2:
-        st.subheader(f"💰 股票 {main_stock} 资金流向与龙虎榜追踪")
+    st.markdown("---")
+    st.subheader("🔍 单股 5 大指标精细化差距诊断")
 
-        df_lhb = fetch_lhb_data(main_stock)
-        if df_lhb is not None and not df_lhb.empty:
-            st.markdown("##### 🏛️ 近 90 天内龙虎榜上榜明细（游资/机构席位）")
-            st.dataframe(df_lhb, use_container_width=True)
+    target_code = st.text_input(
+        "🔎 输入任意股票代码进行 5 大规则差距诊断 (例如: 300277 或 600519):",
+        value=main_stock,
+        key="gap_diag_input"
+    ).strip()
+
+    if target_code:
+        df_diag, summary = diagnose_stock_gap(target_code)
+        if df_diag is not None:
+            st.markdown(
+                f"##### 📌 诊断标的：**{summary['名称']} ({summary['代码']})** | 当前状态：**{summary['匹配度']}**")
+            st.dataframe(df_diag, use_container_width=True)
         else:
-            st.info(f"ℹ️ 近 90 天内股票 {main_stock} 未登龙虎榜或暂无公开发布的席位交易明细。")
+            st.error(summary)
 
-        st.markdown("---")
-        st.markdown("##### ⚡ 主力资金放量异动监控 (超过 5 日均量 2 倍)")
-        df_kline["Vol_MA5"] = df_kline["Volume"].rolling(5).mean()
-        df_kline["Vol_Ratio"] = df_kline["Volume"] / df_kline["Vol_MA5"]
-        heavy_vol = df_kline[df_kline["Vol_Ratio"] >= 2.0][
-            ["日期", "Close", "Volume", "Vol_Ratio"]
-        ]
-        if not heavy_vol.empty:
-            st.dataframe(heavy_vol.tail(10), use_container_width=True)
-        else:
-            st.write("近期未观察到超过 2 倍 5日均量的放大异动。")
+with tab2:
+    if df_kline is not None and not df_kline.empty:
+        st.dataframe(df_kline.tail(20), use_container_width=True)
+    else:
+        st.warning("⚠️ 未能获取到当前股票的历史 K 线行情。")
 
-    # ==========================================
-    # 模块 3：📊 财务基本面与估值（彻底修复显示逻辑）
-    # ==========================================
-    with tab3:
-        st.subheader(f"📊 股票 {main_stock} 基本面健康度与估值分析")
+with tab3:
+    st.subheader(f"🤖 股票 {main_stock} 量化打分卡与智能诊断报告")
 
-        c1, c2, c3 = st.columns(3)
-
-        pe_val = val_dict.get("pe_ttm")
-        pb_val = val_dict.get("pb")
-        mv_val = val_dict.get("total_mv")
-
-        pe_str = f"{float(pe_val):.2f}" if pe_val is not None and str(pe_val) != 'nan' else "N/A"
-        pb_str = f"{float(pb_val):.2f}" if pb_val is not None and str(pb_val) != 'nan' else "N/A"
-        mv_str = f"{float(mv_val):.2f} 亿元" if mv_val is not None and str(mv_val) != 'nan' else "N/A"
-
-        c1.metric("市盈率 PE (TTM)", pe_str)
-        c2.metric("市净率 PB", pb_str)
-        c3.metric("总市值", mv_str)
-
-        st.markdown("---")
-        st.markdown("##### 📋 财务报表摘要")
-        if df_fin is not None and not df_fin.empty:
-            st.dataframe(df_fin, use_container_width=True)
-        else:
-            st.info("暂无详细财务报表摘要数据，系统已基于行情与技术面为您进行量化评分。")
-
-    # ==========================================
-    # 模块 4：🤖 AI 深度诊股与量化打分卡（修复时效性问题）
-    # ==========================================
-    with tab4:
-        st.subheader(f"🤖 股票 {main_stock} 量化打分卡与智能诊断报告")
-
+    if df_kline is None or df_kline.empty:
+        st.error(f"❌ 无法获取股票 [{main_stock}] 的 K 线数据，无法进行量化打分与 AI 诊断。")
+    else:
         quant_score = 50
         score_details = []
         latest = df_kline.iloc[-1]
 
+        # 1. 预先计算与格式化数据，防止变量未定义
+        pe_str = f"{realtime_quote['市盈率']:.2f}" if (realtime_quote and realtime_quote.get('市盈率')) else "N/A"
+        pb_str = f"{realtime_quote['市净率']:.2f}" if (realtime_quote and realtime_quote.get('市净率')) else "N/A"
+        mv_str = f"{realtime_quote['总市值(亿)']:.2f} 亿" if (realtime_quote and realtime_quote.get('总市值(亿)')) else "N/A"
+
+        atr_val = float(latest["ATR"]) if ("ATR" in latest and not pd.isna(latest["ATR"])) else 0.0
+        stop_loss_2atr = latest["Close"] - (2 * atr_val)
+
+        # 2. 技术指标量化打分
         if latest["Close"] > latest["MA20"]:
             quant_score += 15
             score_details.append("✅ 趋势健康：股价稳站在 20 日生命线上方 (+15分)")
@@ -732,7 +527,7 @@ else:
             quant_score -= 10
             score_details.append("⚠️ 趋势受压：股价目前处于 20 日生命线下方 (-10分)")
 
-        rsi_val = latest["RSI"] if not pd.isna(latest.get("RSI")) else 50.0
+        rsi_val = float(latest["RSI"]) if not pd.isna(latest.get("RSI")) else 50.0
         if 45 <= rsi_val <= 65:
             quant_score += 15
             score_details.append(f"✅ 动能温和：RSI 处在上升多头健康区间 ({rsi_val:.1f}) (+15分)")
@@ -777,7 +572,7 @@ else:
                     rt_price = f"{realtime_quote['当前价格']:.2f}" if realtime_quote else f"{latest['Close']:.2f}"
                     rt_pct = f"{realtime_quote['涨跌幅(%)']:+.2f}%" if realtime_quote else "N/A"
 
-                    # 构建包含 100% 实时信息的 Prompt
+                    # 构建包含完整信息的 Prompt
                     prompt = f"""
 【核心指令】：请针对股票 **{stock_name} ({main_stock})** 生成一份时效性极强的专业量化诊断报告。
 诊断评估基准日期：**{today_str}**。
@@ -816,164 +611,3 @@ else:
                 - **动能面**：RSI 处于 **{rsi_val:.2f}**，ATR 真实波幅为 **{atr_val:.2f} 元**。
                 - **风控面**：建议设置动态移动止损位在 **{stop_loss_2atr:.2f} 元** 附近。
                 """)
-
-    # ==========================================
-    # 模块 5：🧪 进阶量化策略回测
-    # ==========================================
-    with tab5:
-        st.subheader("🧪 双均线 + 止盈止损 策略回测引擎")
-
-        b_col1, b_col2, b_col3, b_col4 = st.columns(4)
-        short_ma = b_col1.number_input("短期均线周期", value=5, min_value=2)
-        long_ma = b_col2.number_input("长期均线周期", value=20, min_value=5)
-        tp_pct = b_col3.number_input("硬止盈点位 (%)", value=10.0, step=0.5) / 100.0
-        sl_pct = b_col4.number_input("硬止损点位 (%)", value=5.0, step=0.5) / 100.0
-
-        df_bt = df_kline.copy()
-        df_bt["MA_S"] = df_bt["Close"].rolling(short_ma).mean()
-        df_bt["MA_L"] = df_bt["Close"].rolling(long_ma).mean()
-
-        position = 0
-        buy_price = 0.0
-        equity = [100000.0]
-
-        for i in range(1, len(df_bt)):
-            curr_close = df_bt.iloc[i]["Close"]
-            prev_s = df_bt.iloc[i - 1]["MA_S"]
-            prev_l = df_bt.iloc[i - 1]["MA_L"]
-            curr_s = df_bt.iloc[i]["MA_S"]
-            curr_l = df_bt.iloc[i]["MA_L"]
-
-            if position == 1:
-                ret = (curr_close - buy_price) / buy_price
-                if ret >= tp_pct or ret <= -sl_pct:
-                    position = 0
-
-            if position == 0 and prev_s <= prev_l and curr_s > curr_l:
-                position = 1
-                buy_price = curr_close
-            elif position == 1 and prev_s >= prev_l and curr_s < curr_l:
-                position = 0
-
-            if position == 1:
-                daily_ret = (curr_close - df_bt.iloc[i - 1]["Close"]) / df_bt.iloc[i - 1]["Close"]
-                equity.append(equity[-1] * (1 + daily_ret))
-            else:
-                equity.append(equity[-1])
-
-        df_bt["Equity"] = equity
-        total_ret = (equity[-1] - 100000.0) / 100000.0 * 100.0
-
-        eq_arr = np.array(equity)
-        max_p = np.maximum.accumulate(eq_arr)
-        dd = (eq_arr - max_p) / max_p
-        max_drawdown = dd.min() * 100.0
-
-        returns = pd.Series(equity).pct_change().dropna()
-        sharpe = (
-            (returns.mean() / returns.std()) * np.sqrt(252)
-            if returns.std() != 0
-            else 0.0
-        )
-
-        r1, r2, r3 = st.columns(3)
-        r1.metric("策略累计收益率", f"{total_ret:.2f}%")
-        r2.metric("最大回撤 (Max Drawdown)", f"{max_drawdown:.2f}%")
-        r3.metric("年化夏普比率 (Sharpe)", f"{sharpe:.2f}")
-
-        st.markdown("##### 📈 策略资产净值增长曲线 (基准 10 万元)")
-        st.line_chart(df_bt.set_index("日期")[["Equity"]])
-
-    # ==========================================
-    # 模块 6：⚔️ 多股走势对比与自选对比
-    # ==========================================
-    with tab6:
-        st.subheader("⚔️ 多股归一化收益率对比（识破龙头）")
-        stocks_input = st.text_input(
-            "输入对比的股票代码 (用逗号隔开，如 300277, 600519, 000001):",
-            value="300277, 600519, 000001",
-        )
-
-        if st.button("开始对比分析"):
-            stock_list = [
-                s.strip().zfill(6) for s in stocks_input.split(",") if s.strip()
-            ]
-            fig_comp = go.Figure()
-
-            with st.spinner("正在抓取并归一化计算多股收益率..."):
-                for sym in stock_list:
-                    df_sym = fetch_stock_kline(sym, start_date, end_date)
-                    if df_sym is not None and not df_sym.empty:
-                        base_p = df_sym.iloc[0]["Close"]
-                        df_sym["Normalized"] = (df_sym["Close"] / base_p) * 100.0
-                        fig_comp.add_trace(
-                            go.Scatter(
-                                x=df_sym["日期"],
-                                y=df_sym["Normalized"],
-                                mode="lines",
-                                name=f"股票 {sym}",
-                            )
-                        )
-
-            fig_comp.update_layout(
-                title="多股归一化收益率对比曲线 (初始基准 = 100)",
-                height=500,
-                yaxis_title="相对净值",
-                hovermode="x unified",
-            )
-            st.plotly_chart(fig_comp, use_container_width=True)
-
-    # ==========================================
-    # 模块 7：📡 股票雷达与形态选股
-    # ==========================================
-    with tab7:
-        st.subheader("📡 股票形态选股与多指标扫描雷达")
-        scan_pool_str = st.text_area(
-            "批量扫描股票池代码 (用逗号隔开):",
-            value="300277, 600519, 000001, 000858, 601318",
-        )
-
-        if st.button("🔍 执行批量形态雷达扫描"):
-            targets = [
-                t.strip().zfill(6) for t in scan_pool_str.split(",") if t.strip()
-            ]
-            scan_results = []
-
-            p_bar = st.progress(0)
-            for idx, target in enumerate(targets):
-                df_t = fetch_stock_kline(target, start_date, end_date)
-                if df_t is not None and len(df_t) >= 20:
-                    last_r = df_t.iloc[-1]
-                    prev_r = df_t.iloc[-2]
-
-                    patterns = []
-                    if (
-                            prev_r["MA5"] <= prev_r["MA20"]
-                            and last_r["MA5"] > last_r["MA20"]
-                    ):
-                        patterns.append("🔥 5日/20日均线金叉")
-                    if last_r["RSI"] < 35:
-                        patterns.append("🟢 RSI 低位超卖 (<35)")
-                    elif last_r["RSI"] > 70:
-                        patterns.append("🔴 RSI 高位超买 (>70)")
-                    avg_v10 = df_t["Volume"].tail(10).mean()
-                    if last_r["Volume"] > 2.0 * avg_v10:
-                        patterns.append("⚡ 巨量放量异动")
-
-                    scan_results.append({
-                        "股票代码": target,
-                        "最新收盘价": f"{last_r['Close']:.2f}",
-                        "RSI (14)": (
-                            f"{last_r['RSI']:.2f}"
-                            if not pd.isna(last_r.get("RSI"))
-                            else "N/A"
-                        ),
-                        "20日均线": f"{last_r['MA20']:.2f}",
-                        "特征形态描述": (
-                            " | ".join(patterns) if patterns else "常规盘整形态"
-                        ),
-                    })
-                p_bar.progress((idx + 1) / len(targets))
-
-            st.markdown("##### 🔍 股票雷达匹配扫描结果：")
-            st.dataframe(pd.DataFrame(scan_results), use_container_width=True)

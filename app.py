@@ -213,7 +213,7 @@ def fetch_stock_kline(symbol, start, end):
             except:
                 pass
 
-    # 2. 如果 BaoStock 未取到，降级调用 AkShare
+    # 2. 经典降级：AkShare 历史行情接口
     if (df is None or df.empty) and ak is not None:
         try:
             start_str = "20240101"
@@ -239,7 +239,7 @@ def fetch_stock_kline(symbol, start, end):
         except Exception:
             pass
 
-    # 3. 如果前两者都未取到，降级调用腾讯高频接口
+    # 3. 经典降级：腾讯高频接口
     if df is None or df.empty:
         clean_code = format_symbol_tencent(symbol)
         if clean_code:
@@ -305,12 +305,12 @@ def fetch_stock_kline(symbol, start, end):
 
 
 # ==========================================
-# 3. 严格对齐 5 大指标的全市场扫盘与诊股引擎
+# 3. 经典 AkShare 股票代码表 + 腾讯高频矩阵选股引擎
 # ==========================================
 
 def scan_market_5_rules_strict():
     """
-    使用 ak.stock_info_a_code_name() 获取全市场代码表 + 腾讯批量高频接口获取实时行情
+    经典架构：使用 ak.stock_info_a_code_name() 获取全市场代码表 + 腾讯批量高频接口获取实时行情
     """
     if ak is None:
         return pd.DataFrame(), "❌ AkShare 库未成功安装。"
@@ -323,7 +323,7 @@ def scan_market_5_rules_strict():
         if df_info is not None and not df_info.empty:
             code_col = 'code' if 'code' in df_info.columns else df_info.columns[0]
             name_col = 'name' if 'name' in df_info.columns else df_info.columns[1]
-
+            
             for _, row in df_info.iterrows():
                 c = str(row[code_col]).zfill(6)
                 n = str(row[name_col])
@@ -346,7 +346,7 @@ def scan_market_5_rules_strict():
     session.trust_env = False
 
     for i in range(0, len(tencent_codes), batch_size):
-        batch = tencent_codes[i:i + batch_size]
+        batch = tencent_codes[i:i+batch_size]
         q_str = ",".join(batch)
         url = f"http://qt.gtimg.cn/q={q_str}"
         headers = {
@@ -369,8 +369,7 @@ def scan_market_5_rules_strict():
                                 price = float(vals[3]) if vals[3] and vals[3] != "N/A" else 0.0
                                 pct = float(vals[32]) if vals[32] and vals[32] != "N/A" else 0.0
                                 circ_mv = float(vals[44]) if len(vals) > 44 and vals[44] and vals[44] != "N/A" else 0.0
-                                volume_ratio = float(vals[49]) if len(vals) > 49 and vals[49] and vals[
-                                    49] != "N/A" else 1.1
+                                volume_ratio = float(vals[49]) if len(vals) > 49 and vals[49] and vals[49] != "N/A" else 1.1
 
                                 all_quotes.append({
                                     "代码": code,
@@ -397,7 +396,7 @@ def scan_market_5_rules_strict():
         candidates = df_spot[cond_pct & cond_vr & cond_mv].copy()
 
         status_msg = (
-            f"🌐 **全市场数据接入成功（AKShare 列表 + 腾讯高频矩阵）**：顺利扫描全市场 **{len(df_spot)}** 只 A 股！\n\n"
+            f"🌐 **AkShare 列表 + 腾讯高频矩阵接入成功**：顺利扫描全市场 **{len(df_spot)}** 只 A 股！\n\n"
             f"🔍 **第一轮初筛（涨幅 3% 至 5% + 量比 > 1 + 流通市值 50亿至200亿）**：通过筛选进入 K 线精算的候选股仅剩 **{len(candidates)}** 只。"
         )
 
@@ -437,8 +436,8 @@ def scan_market_5_rules_strict():
                 ma20 = latest_k.get("MA20", 0)
 
                 c5_pass = (
-                        not pd.isna(ma5) and not pd.isna(ma10) and not pd.isna(ma20)
-                        and (ma5 > ma10 > ma20)
+                    not pd.isna(ma5) and not pd.isna(ma10) and not pd.isna(ma20)
+                    and (ma5 > ma10 > ma20)
                 )
 
                 if c1_pass and c5_pass:
@@ -466,7 +465,7 @@ def scan_market_5_rules_strict():
 
 def diagnose_stock_gap(symbol):
     """
-    单股 5 大指标差距精细化诊断（带异常兜底）
+    单股 5 大指标差距精细化诊断
     """
     try:
         code = str(symbol).strip().zfill(6)
@@ -584,7 +583,7 @@ with tab1:
         """)
 
     if st.button("🚀 执行全市场 5 大指标精准扫盘选股", type="primary"):
-        with st.spinner("正在通过 AKShare + 腾讯高频矩阵扫描全市场 A 股，匹配 5 大选股规则..."):
+        with st.spinner("正在通过 AkShare + 腾讯高频矩阵扫描全市场 A 股，匹配 5 大选股规则..."):
             df_results, status_msg = scan_market_5_rules_strict()
             st.session_state["scan_results_df"] = df_results
             st.session_state["scan_status_msg"] = status_msg

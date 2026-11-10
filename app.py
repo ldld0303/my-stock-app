@@ -178,7 +178,7 @@ def fetch_stock_kline(symbol, start, end):
     symbol = str(symbol).strip().zfill(6)
     df = None
 
-    # 1. 优先使用 BaoStock 获取历史 K 线（最稳定、不封锁 IP、境内外通用）
+    # 1. 优先使用 BaoStock 获取历史 K 线
     if bs is not None:
         try:
             lg = bs.login()
@@ -213,7 +213,7 @@ def fetch_stock_kline(symbol, start, end):
             except:
                 pass
 
-    # 2. 经典降级：AkShare 历史行情接口
+    # 2. 降级调用 AkShare
     if (df is None or df.empty) and ak is not None:
         try:
             start_str = "20240101"
@@ -239,7 +239,7 @@ def fetch_stock_kline(symbol, start, end):
         except Exception:
             pass
 
-    # 3. 经典降级：腾讯高频接口
+    # 3. 降级调用腾讯高频接口
     if df is None or df.empty:
         clean_code = format_symbol_tencent(symbol)
         if clean_code:
@@ -274,7 +274,6 @@ def fetch_stock_kline(symbol, start, end):
         df["日期"] = pd.to_datetime(df["日期"])
         df = df.sort_values("日期").reset_index(drop=True)
 
-        # 计算所有量化指标
         df["MA5"] = df["Close"].rolling(5).mean()
         df["MA10"] = df["Close"].rolling(10).mean()
         df["MA20"] = df["Close"].rolling(20).mean()
@@ -305,162 +304,135 @@ def fetch_stock_kline(symbol, start, end):
 
 
 # ==========================================
-# 3. 经典 AkShare 股票代码表 + 腾讯高频矩阵选股引擎
+# 3. 极速单次 HTTP 直连全市场扫盘引擎（完美适配手机与电脑）
 # ==========================================
 
 def scan_market_5_rules_strict():
     """
-    经典架构：使用 ak.stock_info_a_code_name() 获取全市场代码表 + 腾讯批量高频接口获取实时行情
+    单次直连东方财富量化接口获取全市场实时行情与市值，彻底解决手机端多次循环请求超时与风控问题
     """
-    if ak is None:
-        return pd.DataFrame(), "❌ AkShare 库未成功安装。"
-
-    tencent_codes = []
-    code_name_map = {}
-
-    try:
-        df_info = ak.stock_info_a_code_name()
-        if df_info is not None and not df_info.empty:
-            code_col = 'code' if 'code' in df_info.columns else df_info.columns[0]
-            name_col = 'name' if 'name' in df_info.columns else df_info.columns[1]
-            
-            for _, row in df_info.iterrows():
-                c = str(row[code_col]).zfill(6)
-                n = str(row[name_col])
-                code_name_map[c] = n
-                if c.startswith(("6", "688", "900")):
-                    tencent_codes.append(f"sh{c}")
-                elif c.startswith(("0", "3", "200")):
-                    tencent_codes.append(f"sz{c}")
-                elif c.startswith(("8", "4", "920")):
-                    tencent_codes.append(f"bj{c}")
-    except Exception as e:
-        return pd.DataFrame(), f"❌ 获取全市场股票代码列表失败：{str(e)}"
-
-    if not tencent_codes:
-        return pd.DataFrame(), "❌ 未能解析到任何有效的 A 股股票代码。"
-
-    batch_size = 50
-    all_quotes = []
-    session = requests.Session()
-    session.trust_env = False
-
-    for i in range(0, len(tencent_codes), batch_size):
-        batch = tencent_codes[i:i+batch_size]
-        q_str = ",".join(batch)
-        url = f"http://qt.gtimg.cn/q={q_str}"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Referer": "https://finance.qq.com/",
-            "Connection": "close"
-        }
-        try:
-            res = session.get(url, headers=headers, timeout=4, verify=False)
-            if res.status_code == 200:
-                text = res.content.decode("gbk", errors="ignore")
-                for line in text.split("\n"):
-                    if "=" in line and '"' in line:
-                        parts = line.split('"')
-                        if len(parts) >= 2:
-                            vals = parts[1].split("~")
-                            if len(vals) >= 38:
-                                name = vals[1]
-                                code = vals[2]
-                                price = float(vals[3]) if vals[3] and vals[3] != "N/A" else 0.0
-                                pct = float(vals[32]) if vals[32] and vals[32] != "N/A" else 0.0
-                                circ_mv = float(vals[44]) if len(vals) > 44 and vals[44] and vals[44] != "N/A" else 0.0
-                                volume_ratio = float(vals[49]) if len(vals) > 49 and vals[49] and vals[49] != "N/A" else 1.1
-
-                                all_quotes.append({
-                                    "代码": code,
-                                    "名称": code_name_map.get(code, name),
-                                    "最新价": price,
-                                    "涨跌幅": pct,
-                                    "流通市值(亿)": circ_mv,
-                                    "量比": volume_ratio
-                                })
-        except Exception:
-            pass
-        time.sleep(0.01)
-
-    if not all_quotes:
-        return pd.DataFrame(), "❌ 批量获取腾讯实时行情数据失败。"
-
-    df_spot = pd.DataFrame(all_quotes)
+    url = "http://push2.eastmoney.com/api/qt/clist/get"
+    params = {
+        "pn": "1",
+        "pz": "6000",
+        "po": "1",
+        "np": "1",
+        "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+        "fltt": "2",
+        "invt": "2",
+        "fid": "f3",
+        "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:8+t:51",
+        "fields": "f12,f14,f2,f3,f10,f20,f21"
+    }
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": "https://quote.eastmoney.com/"
+    }
 
     try:
-        cond_pct = df_spot["涨跌幅"].between(3.0, 5.0)
-        cond_vr = (df_spot["量比"] > 1.0) | (df_spot["量比"].isna()) | (df_spot["量比"] == 0)
-        cond_mv = df_spot["流通市值(亿)"].between(50.0, 200.0)
+        res = requests.get(url, params=params, headers=headers, timeout=8, verify=False)
+        if res.status_code == 200:
+            data = res.json()
+            if data and "data" in data and data["data"] and "diff" in data["data"]:
+                rows = data["data"]["diff"]
+                all_quotes = []
+                for item in rows:
+                    code = str(item.get("f12", "")).zfill(6)
+                    name = str(item.get("f14", ""))
+                    price = float(item.get("f2", 0) or 0)
+                    pct = float(item.get("f3", 0) or 0)
+                    vr = float(item.get("f10", 1.2) or 1.2)
+                    circ_mv = float(item.get("f21", 0) or 0) / 100000000  # 转换为亿元
 
-        candidates = df_spot[cond_pct & cond_vr & cond_mv].copy()
+                    if code and len(code) == 6:
+                        all_quotes.append({
+                            "代码": code,
+                            "名称": name,
+                            "最新价": price,
+                            "涨跌幅": pct,
+                            "流通市值(亿)": circ_mv,
+                            "量比": vr
+                        })
 
-        status_msg = (
-            f"🌐 **AkShare 列表 + 腾讯高频矩阵接入成功**：顺利扫描全市场 **{len(df_spot)}** 只 A 股！\n\n"
-            f"🔍 **第一轮初筛（涨幅 3% 至 5% + 量比 > 1 + 流通市值 50亿至200亿）**：通过筛选进入 K 线精算的候选股仅剩 **{len(candidates)}** 只。"
-        )
+                if not all_quotes:
+                    return pd.DataFrame(), "❌ 未能解析到任何有效的 A 股市场行情数据。"
 
-        if candidates.empty:
-            return pd.DataFrame(), status_msg
+                df_spot = pd.DataFrame(all_quotes)
 
-        results = []
-        today_dt = datetime.date.today()
-        start_180d = today_dt - datetime.timedelta(days=180)
+                # 第一轮初筛：涨幅 3% 至 5% + 量比 > 1 + 流通市值 50亿至200亿
+                cond_pct = df_spot["涨跌幅"].between(3.0, 5.0)
+                cond_vr = (df_spot["量比"] > 1.0) | (df_spot["量比"].isna())
+                cond_mv = df_spot["流通市值(亿)"].between(50.0, 200.0)
 
-        total_cand = len(candidates)
-        progress_bar = st.progress(0)
-        status_text = st.empty()
+                candidates = df_spot[cond_pct & cond_vr & cond_mv].copy()
 
-        for idx, (_, row) in enumerate(candidates.iterrows()):
-            progress_bar.progress(min((idx + 1) / max(total_cand, 1), 1.0))
-            status_text.text(f"正在精算候选股 K 线 ({idx + 1}/{total_cand}): {row['代码']} {row['名称']}")
-
-            code = str(row["代码"]).zfill(6)
-            name = row["名称"]
-            price = row["最新价"]
-            pct = row["涨跌幅"]
-            vr = row["量比"]
-            circ_mv = row["流通市值(亿)"]
-
-            time.sleep(0.01)
-
-            df_k = fetch_stock_kline(code, start_180d, today_dt)
-            if df_k is not None and len(df_k) >= 20:
-                max_60d = df_k["High"].tail(60).max()
-                drop_ratio = (max_60d - price) / max_60d if max_60d > 0 else 0.0
-                c1_pass = drop_ratio >= 0.40  # 跌幅门槛为 40%
-
-                latest_k = df_k.iloc[-1]
-                ma5 = latest_k.get("MA5", 0)
-                ma10 = latest_k.get("MA10", 0)
-                ma20 = latest_k.get("MA20", 0)
-
-                c5_pass = (
-                    not pd.isna(ma5) and not pd.isna(ma10) and not pd.isna(ma20)
-                    and (ma5 > ma10 > ma20)
+                status_msg = (
+                    f"🌐 **全市场数据接入成功（极速直连矩阵）**：顺利扫描全市场 **{len(df_spot)}** 只 A 股！\n\n"
+                    f"🔍 **第一轮初筛（涨幅 3% 至 5% + 量比 > 1 + 流通市值 50亿至200亿）**：通过筛选进入 K 线精算的候选股仅剩 **{len(candidates)}** 只。"
                 )
 
-                if c1_pass and c5_pass:
-                    results.append({
-                        "股票代码": code,
-                        "股票名称": name,
-                        "最新价": price,
-                        "涨跌幅(%)": pct,
-                        "量比": vr,
-                        "流通市值(亿)": round(circ_mv, 2),
-                        "60日高点跌幅(%)": round(drop_ratio * 100, 2),
-                        "MA5": round(ma5, 2),
-                        "MA10": round(ma10, 2),
-                        "MA20": round(ma20, 2),
-                        "均线形态": "MA5 > MA10 > MA20 (多头排列)"
-                    })
+                if candidates.empty:
+                    return pd.DataFrame(), status_msg
 
-        progress_bar.empty()
-        status_text.empty()
+                results = []
+                today_dt = datetime.date.today()
+                start_180d = today_dt - datetime.timedelta(days=180)
 
-        return pd.DataFrame(results), status_msg
+                total_cand = len(candidates)
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+
+                for idx, (_, row) in enumerate(candidates.iterrows()):
+                    progress_bar.progress(min((idx + 1) / max(total_cand, 1), 1.0))
+                    status_text.text(f"正在精算候选股 K 线 ({idx + 1}/{total_cand}): {row['代码']} {row['名称']}")
+
+                    code = row["代码"]
+                    name = row["名称"]
+                    price = row["最新价"]
+                    pct = row["涨跌幅"]
+                    vr = row["量比"]
+                    circ_mv = row["流通市值(亿)"]
+
+                    time.sleep(0.01)
+                    df_k = fetch_stock_kline(code, start_180d, today_dt)
+                    if df_k is not None and len(df_k) >= 20:
+                        max_60d = df_k["High"].tail(60).max()
+                        drop_ratio = (max_60d - price) / max_60d if max_60d > 0 else 0.0
+                        c1_pass = drop_ratio >= 0.40  # 跌幅门槛为 40%
+
+                        latest_k = df_k.iloc[-1]
+                        ma5 = latest_k.get("MA5", 0)
+                        ma10 = latest_k.get("MA10", 0)
+                        ma20 = latest_k.get("MA20", 0)
+
+                        c5_pass = (
+                            not pd.isna(ma5) and not pd.isna(ma10) and not pd.isna(ma20)
+                            and (ma5 > ma10 > ma20)
+                        )
+
+                        if c1_pass and c5_pass:
+                            results.append({
+                                "股票代码": code,
+                                "股票名称": name,
+                                "最新价": price,
+                                "涨跌幅(%)": pct,
+                                "量比": vr,
+                                "流通市值(亿)": round(circ_mv, 2),
+                                "60日高点跌幅(%)": round(drop_ratio * 100, 2),
+                                "MA5": round(ma5, 2),
+                                "MA10": round(ma10, 2),
+                                "MA20": round(ma20, 2),
+                                "均线形态": "MA5 > MA10 > MA20 (多头排列)"
+                            })
+
+                progress_bar.empty()
+                status_text.empty()
+
+                return pd.DataFrame(results), status_msg
     except Exception as e:
         return pd.DataFrame(), f"❌ 执行全市场扫盘计算时出现异常：{str(e)}"
+
+    return pd.DataFrame(), "❌ 获取全市场股票代码列表失败，请检查手机网络连接。"
 
 
 def diagnose_stock_gap(symbol):
@@ -583,7 +555,7 @@ with tab1:
         """)
 
     if st.button("🚀 执行全市场 5 大指标精准扫盘选股", type="primary"):
-        with st.spinner("正在通过 AkShare + 腾讯高频矩阵扫描全市场 A 股，匹配 5 大选股规则..."):
+        with st.spinner("正在通过极速直连矩阵扫描全市场 A 股，匹配 5 大选股规则..."):
             df_results, status_msg = scan_market_5_rules_strict()
             st.session_state["scan_results_df"] = df_results
             st.session_state["scan_status_msg"] = status_msg

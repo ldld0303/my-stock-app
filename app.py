@@ -36,7 +36,7 @@ sf_api_key = st.sidebar.text_input(
 sf_model = st.sidebar.selectbox(
     "🤖 诊断模型选择",
     [
-        "deepseek-ai/DeepSeek-V3",
+        "deepseek-ai/DeepSeek-V4",
         "deepseek-ai/DeepSeek-R1",
         "Qwen/Qwen2.5-72B-Instruct",
         "THUDM/glm-4-9b-chat",
@@ -60,7 +60,7 @@ st.title("📈 A股全景量化决策与AI智能诊股终端")
 # 2. 底层 API 与数据获取函数
 # ==========================================
 
-def call_siliconflow_api(prompt, api_key, model="deepseek-ai/DeepSeek-V3"):
+def call_siliconflow_api(prompt, api_key, model="deepseek-ai/DeepSeek-V4"):
     """
     调用硅基流动 (SiliconFlow) API 生成诊股报告
     """
@@ -287,6 +287,13 @@ def scan_market_5_rules_strict():
         cond_mv = df_spot["流通市值(亿)"].between(50.0, 200.0)
 
         candidates = df_spot[cond_pct & cond_vr & cond_mv].copy()
+
+        # 页面显示扫描监控数据
+        st.info(
+            f"🌐 **全市场数据接入验证**：已成功拉取 **{len(df_spot)}** 只 A 股全量数据！\n\n"
+            f"🔍 **第一轮初筛结果（涨幅 3%~5% + 流通市值 50~200亿）**：通过筛选进入 K 线精算的候选股仅剩 **{len(candidates)}** 只。"
+        )
+
         if candidates.empty:
             return pd.DataFrame()
 
@@ -308,7 +315,7 @@ def scan_market_5_rules_strict():
             if df_k is not None and len(df_k) >= 20:
                 max_60d = df_k["High"].tail(60).max()
                 drop_ratio = (max_60d - price) / max_60d if max_60d > 0 else 0.0
-                c1_pass = drop_ratio >= 0.50
+                c1_pass = drop_ratio >= 0.40  # 跌幅条件改为 40%
 
                 latest_k = df_k.iloc[-1]
                 ma5 = latest_k.get("MA5", 0)
@@ -363,8 +370,8 @@ def diagnose_stock_gap(symbol):
 
     max_60d = df_k["High"].tail(60).max()
     drop_ratio = (max_60d - price) / max_60d * 100 if max_60d > 0 else 0.0
-    c1_pass = drop_ratio >= 50.0
-    c1_gap = "✅ 满足" if c1_pass else f"❌ 差 {50.0 - drop_ratio:.2f}%（需再跌至 {max_60d * 0.5:.2f} 元）"
+    c1_pass = drop_ratio >= 40.0  # 跌幅门槛修改为 40%
+    c1_gap = "✅ 满足" if c1_pass else f"❌ 差 {40.0 - drop_ratio:.2f}%（需再跌至 {max_60d * 0.6:.2f} 元）"
 
     c2_pass = 3.0 <= pct <= 5.0
     if c2_pass:
@@ -395,7 +402,7 @@ def diagnose_stock_gap(symbol):
     matched_count = sum([c1_pass, c2_pass, c3_pass, c4_pass, c5_pass])
 
     diag_data = [
-        {"指标名称": "1. 近 2-3 个月跌幅", "标准要求": "≥ 50.0%",
+        {"指标名称": "1. 近 2-3 个月跌幅", "标准要求": "≥ 40.0%",
          "实际数值": f"{drop_ratio:.2f}% (60日高点: {max_60d:.2f}元)", "差距判定": c1_gap},
         {"指标名称": "2. 尾盘涨幅", "标准要求": "3.0% — 5.0%", "实际数值": f"{pct:+.2f}%", "差距判定": c2_gap},
         {"指标名称": "3. 量比", "标准要求": "> 1.0", "实际数值": f"{vr:.2f}", "差距判定": c3_gap},
@@ -449,7 +456,7 @@ with tab1:
 
     with st.expander("📋 当前运行的 5 大量化选股规则（已精准核对对齐）", expanded=True):
         st.markdown("""
-        1. **近2-3个月内跌幅 ≥ 50%**（过去 60 交易日最高价对比当前最新价跌幅 50% 以上）
+        1. **近2-3个月内跌幅 ≥ 40%**（过去 60 交易日最高价对比当前最新价跌幅 40% 以上）
         2. **当日涨幅 3.0% — 5.0%**（尾盘异动走强，锁定 3%—5% 区间）
         3. **量比 > 1.0**（成交量放大，资金开始关注）
         4. **流通市值在 50 亿 — 200 亿**（中等市值标的）
